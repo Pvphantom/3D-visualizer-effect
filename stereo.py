@@ -2,25 +2,30 @@ import cv2
 import numpy as np
 
 
-def _prepare_layers(image_bgr: np.ndarray, depth_map: np.ndarray, num_layers: int = 8) -> dict:
+def _prepare_layers(image_bgr: np.ndarray, depth_map: np.ndarray, num_layers: int = 12, max_shift: int = 20) -> dict:
     """Prepare a background plate and depth-sorted layers for compositing."""
     h, w = image_bgr.shape[:2]
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    depth_f = depth_map.astype(np.float32) / 255.0
+    median_depth = np.median(depth_f)
 
-    all_fg_mask = (depth_map > np.percentile(depth_map, 25)).astype(np.uint8) * 255
-    all_fg_mask = cv2.dilate(all_fg_mask, kernel)
-    bg_plate = cv2.inpaint(image_bgr, all_fg_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+    fg_binary = (depth_f > median_depth).astype(np.uint8)
+    strip_width = max_shift + 10
+    dilated = cv2.dilate(fg_binary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (strip_width * 2 + 1, strip_width * 2 + 1)))
+    border_strip = ((dilated - fg_binary) * 255).astype(np.uint8)
+    bg_plate = cv2.inpaint(image_bgr, border_strip, inpaintRadius=8, flags=cv2.INPAINT_TELEA)
 
-    thresholds = np.linspace(0, 256, num_layers + 1)
+    thresholds = np.linspace(0, 1.0, num_layers + 1)
+    margin = 0.5 / num_layers
     layers = []
     for i in range(num_layers):
         lo, hi = thresholds[i], thresholds[i + 1]
-        mask = ((depth_map >= lo) & (depth_map < hi)).astype(np.float32)
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        mid_depth = (lo + hi) / 2.0 / 255.0
+        mask = ((depth_f >= lo) & (depth_f < hi)).astype(np.float32)
+        mask = cv2.GaussianBlur(mask, (11, 11), 0)
+        mask[depth_f < (lo - margin)] = 0
+        mask[depth_f > (hi + margin)] = 0
+        mid_depth = (lo + hi) / 2.0
         layers.append({"mask": mask, "depth": mid_depth})
 
-    median_depth = np.median(depth_map.astype(np.float32)) / 255.0
     return {"bg_plate": bg_plate, "layers": layers, "median_depth": median_depth}
 
 
@@ -32,7 +37,7 @@ def generate_shifted_view(
     if _cache is not None and "data" in _cache:
         data = _cache["data"]
     else:
-        data = _prepare_layers(image_bgr, depth_map)
+        data = _prepare_layers(image_bgr, depth_map, max_shift=max_shift)
         if _cache is not None:
             _cache["data"] = data
 
