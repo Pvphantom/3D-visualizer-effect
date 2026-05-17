@@ -52,7 +52,7 @@ def main():
         "--output-dir", "-o", default="output", help="Output directory (default: output)"
     )
     parser.add_argument(
-        "--max-shift", type=int, default=30, help="Max parallax shift in pixels (default: 30)"
+        "--max-shift", type=int, default=20, help="Max parallax shift in pixels (default: 20)"
     )
     parser.add_argument(
         "--gif-speed", type=int, default=80, help="GIF frame duration in ms (default: 80)"

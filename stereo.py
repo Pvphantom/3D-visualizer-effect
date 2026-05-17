@@ -2,62 +2,60 @@ import cv2
 import numpy as np
 
 
-def _make_foreground_mask(depth_map: np.ndarray) -> np.ndarray:
-    """Create a soft foreground mask from the depth map using Otsu thresholding."""
-    _, binary = cv2.threshold(depth_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+def _prepare_layers(image_bgr: np.ndarray, depth_map: np.ndarray, num_layers: int = 8) -> dict:
+    """Prepare a background plate and depth-sorted layers for compositing."""
+    h, w = image_bgr.shape[:2]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    soft = cv2.GaussianBlur(binary, (21, 21), 0)
-    return soft.astype(np.float32) / 255.0
 
+    all_fg_mask = (depth_map > np.percentile(depth_map, 25)).astype(np.uint8) * 255
+    all_fg_mask = cv2.dilate(all_fg_mask, kernel)
+    bg_plate = cv2.inpaint(image_bgr, all_fg_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
 
-def _inpaint_background(image_bgr: np.ndarray, mask_float: np.ndarray) -> np.ndarray:
-    """Fill in the foreground region to create a clean background plate."""
-    inpaint_mask = (mask_float > 0.5).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-    inpaint_mask = cv2.dilate(inpaint_mask, kernel)
-    return cv2.inpaint(image_bgr, inpaint_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+    thresholds = np.linspace(0, 256, num_layers + 1)
+    layers = []
+    for i in range(num_layers):
+        lo, hi = thresholds[i], thresholds[i + 1]
+        mask = ((depth_map >= lo) & (depth_map < hi)).astype(np.float32)
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+        mid_depth = (lo + hi) / 2.0 / 255.0
+        layers.append({"mask": mask, "depth": mid_depth})
 
-
-def _shift_layer(layer: np.ndarray, dx: int) -> np.ndarray:
-    """Translate a layer horizontally by dx pixels."""
-    M = np.float32([[1, 0, dx], [0, 1, 0]])
-    return cv2.warpAffine(layer, M, (layer.shape[1], layer.shape[0]), borderMode=cv2.BORDER_REPLICATE)
+    median_depth = np.median(depth_map.astype(np.float32)) / 255.0
+    return {"bg_plate": bg_plate, "layers": layers, "median_depth": median_depth}
 
 
 def generate_shifted_view(
-    image_bgr: np.ndarray, depth_map: np.ndarray, shift_fraction: float, max_shift: int = 30,
+    image_bgr: np.ndarray, depth_map: np.ndarray, shift_fraction: float, max_shift: int = 20,
     _cache: dict | None = None,
 ) -> np.ndarray:
-    """Generate a shifted view using layer-based compositing.
-
-    Foreground and background are separated, shifted in opposite directions, then composited.
-    """
-    if _cache is not None and "fg_mask" in _cache:
-        fg_mask = _cache["fg_mask"]
-        bg_plate = _cache["bg_plate"]
+    """Generate a novel view using multi-plane compositing over a clean background."""
+    if _cache is not None and "data" in _cache:
+        data = _cache["data"]
     else:
-        fg_mask = _make_foreground_mask(depth_map)
-        bg_plate = _inpaint_background(image_bgr, fg_mask)
+        data = _prepare_layers(image_bgr, depth_map)
         if _cache is not None:
-            _cache["fg_mask"] = fg_mask
-            _cache["bg_plate"] = bg_plate
+            _cache["data"] = data
 
-    fg_shift = int(max_shift * shift_fraction)
-    bg_shift = int(-max_shift * 0.3 * shift_fraction)
+    h, w = image_bgr.shape[:2]
+    median = data["median_depth"]
 
-    bg_shifted = _shift_layer(bg_plate, bg_shift)
-    fg_shifted = _shift_layer(image_bgr, fg_shift)
-    mask_shifted = _shift_layer((fg_mask * 255).astype(np.uint8), fg_shift).astype(np.float32) / 255.0
+    bg_shift = int((0 - median) * max_shift * shift_fraction * 2)
+    M_bg = np.float32([[1, 0, bg_shift], [0, 1, 0]])
+    result = cv2.warpAffine(data["bg_plate"], M_bg, (w, h), borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
 
-    mask_3ch = np.stack([mask_shifted] * 3, axis=-1)
-    composite = (fg_shifted.astype(np.float32) * mask_3ch + bg_shifted.astype(np.float32) * (1 - mask_3ch))
-    return composite.astype(np.uint8)
+    for layer in data["layers"]:
+        shift_px = int((layer["depth"] - median) * max_shift * shift_fraction * 2)
+        M = np.float32([[1, 0, shift_px], [0, 1, 0]])
+        shifted_img = cv2.warpAffine(image_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        shifted_mask = cv2.warpAffine(layer["mask"], M, (w, h), borderMode=cv2.BORDER_CONSTANT)
+        alpha = np.stack([shifted_mask] * 3, axis=-1)
+        result = result * (1 - alpha) + shifted_img * alpha
+
+    return result.astype(np.uint8)
 
 
 def generate_stereo_pair(
-    image_bgr: np.ndarray, depth_map: np.ndarray, max_shift: int = 30
+    image_bgr: np.ndarray, depth_map: np.ndarray, max_shift: int = 20
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate left and right eye views."""
     cache = {}
