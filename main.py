@@ -2,98 +2,64 @@ import argparse
 import os
 import sys
 
-import cv2
-import numpy as np
+from PIL import Image
 
-from depth import estimate_depth
-from gif import create_wiggle_gif
-from stereo import generate_stereo_pair
-
-
-def load_image(source: str) -> np.ndarray:
-    if source == "webcam":
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Error: cannot open webcam")
-            sys.exit(1)
-        print("Press SPACE to capture, ESC to quit")
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Error: failed to read from webcam")
-                sys.exit(1)
-            cv2.imshow("Webcam - Press SPACE to capture", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord(" "):
-                cap.release()
-                cv2.destroyAllWindows()
-                return frame
-            elif key == 27:
-                cap.release()
-                cv2.destroyAllWindows()
-                sys.exit(0)
-    else:
-        image = cv2.imread(source)
-        if image is None:
-            print(f"Error: cannot read image '{source}'")
-            sys.exit(1)
-        return image
+from style_transfer import run_style_transfer, load_image, tensor_to_image
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Monocular Depth-Based 3D Effect Generator"
-    )
-    parser.add_argument(
-        "source",
-        help="Path to input image, or 'webcam' to capture from camera",
-    )
-    parser.add_argument(
-        "--output-dir", "-o", default="output", help="Output directory (default: output)"
-    )
-    parser.add_argument(
-        "--max-shift", type=int, default=20, help="Max parallax shift in pixels (default: 20)"
-    )
-    parser.add_argument(
-        "--gif-speed", type=int, default=80, help="GIF frame duration in ms (default: 80)"
-    )
-    parser.add_argument(
-        "--num-frames", type=int, default=20, help="Number of frames in wiggle GIF (default: 20)"
-    )
+    parser = argparse.ArgumentParser(description="Neural Style Transfer (Gatys et al.)")
+    parser.add_argument("content", help="Path to content image")
+    parser.add_argument("style", help="Path to style image")
+    parser.add_argument("--output-dir", "-o", default="output", help="Output directory (default: output)")
+    parser.add_argument("--steps", type=int, default=300, help="Optimization steps (default: 300)")
+    parser.add_argument("--content-weight", type=float, default=1.0, help="Content weight (default: 1.0)")
+    parser.add_argument("--style-weight", type=float, default=1e6, help="Style weight (default: 1e6)")
+    parser.add_argument("--max-size", type=int, default=512, help="Max image dimension in pixels (default: 512)")
+    parser.add_argument("--save-progress", action="store_true", help="Save intermediate steps as images")
     args = parser.parse_args()
 
+    for path in [args.content, args.style]:
+        if not os.path.isfile(path):
+            print(f"Error: cannot find '{path}'")
+            sys.exit(1)
+
     os.makedirs(args.output_dir, exist_ok=True)
+    progress_dir = os.path.join(args.output_dir, "progress")
+    if args.save_progress:
+        os.makedirs(progress_dir, exist_ok=True)
 
-    print("Loading image...")
-    image = load_image(args.source)
+    def on_step(step, total, pastiche_tensor):
+        if args.save_progress:
+            img = tensor_to_image(pastiche_tensor)
+            img.save(os.path.join(progress_dir, f"step_{step:04d}.png"))
 
-    print("Estimating depth with MiDaS...")
-    depth_map = estimate_depth(image)
+    print(f"Content: {args.content}")
+    print(f"Style:   {args.style}")
+    print(f"Running {args.steps} optimization steps...\n")
 
-    print("Generating stereo pair...")
-    left_view, right_view = generate_stereo_pair(image, depth_map, args.max_shift)
+    result = run_style_transfer(
+        content_path=args.content,
+        style_path=args.style,
+        num_steps=args.steps,
+        content_weight=args.content_weight,
+        style_weight=args.style_weight,
+        max_size=args.max_size,
+        on_step=on_step,
+    )
 
-    original_path = os.path.join(args.output_dir, "original.png")
-    depth_path = os.path.join(args.output_dir, "depth_map.png")
-    left_path = os.path.join(args.output_dir, "left_view.png")
-    right_path = os.path.join(args.output_dir, "right_view.png")
-    gif_path = os.path.join(args.output_dir, "wiggle_3d.gif")
+    output_path = os.path.join(args.output_dir, "stylized.png")
+    result.save(output_path)
 
-    cv2.imwrite(original_path, image)
-    depth_colormap = cv2.applyColorMap(depth_map, cv2.COLORMAP_MAGMA)
-    cv2.imwrite(depth_path, depth_colormap)
-    cv2.imwrite(left_path, left_view)
-    cv2.imwrite(right_path, right_view)
-
-    print("Creating wiggle GIF...")
-    create_wiggle_gif(image, depth_map, gif_path, args.max_shift, args.num_frames, args.gif_speed)
+    content_copy = Image.open(args.content).convert("RGB")
+    content_copy.save(os.path.join(args.output_dir, "content.png"))
+    style_copy = Image.open(args.style).convert("RGB")
+    style_copy.save(os.path.join(args.output_dir, "style.png"))
 
     print(f"\nOutputs saved to '{args.output_dir}/':")
-    print(f"  - {original_path}")
-    print(f"  - {depth_path}")
-    print(f"  - {left_path}")
-    print(f"  - {right_path}")
-    print(f"  - {gif_path}")
+    print(f"  - {output_path}")
+    if args.save_progress:
+        print(f"  - {progress_dir}/ (intermediate steps)")
 
 
 if __name__ == "__main__":
